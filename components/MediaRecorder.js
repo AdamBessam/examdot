@@ -18,10 +18,12 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
   const [uploadProgress, setUploadProgress] = useState('');
   const [showCamera, setShowCamera] = useState(false);
   const [permissionsReady, setPermissionsReady] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false); // Track camera readiness
   
   const cameraRef = useRef(null);
   const recordingRef = useRef(null);
   const uploadTimeoutRef = useRef(null);
+  const videoRecordingRef = useRef(null); // Store the actual recording object
 
   useEffect(() => {
     console.log('MediaRecorder: Component mounted, requesting permissions...');
@@ -91,8 +93,9 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
     setRecordingType(type);
     
     if (type === 'video') {
-      // Show camera immediately and start recording
+      // Show camera but don't auto-start recording
       setShowCamera(true);
+      setCameraReady(false); // Reset camera ready state
     } else if (type === 'audio') {
       // Start audio recording directly
       startAudioRecording();
@@ -139,30 +142,41 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
   };
 
   const startVideoRecording = async () => {
+    if (!cameraRef.current) {
+      console.error('MediaRecorder: Camera reference not available');
+      return;
+    }
+    if (!cameraReady) {
+      console.error('MediaRecorder: Camera not ready yet');
+      return;
+    }
+    if (isRecording) {
+      console.log('MediaRecorder: Already recording, ignoring start request');
+      return;
+    }
+
     try {
-      console.log('MediaRecorder: Starting video recording...');
-      
-      if (!cameraRef.current) {
-        throw new Error('Camera not available');
+      // First, ensure no recording is in progress
+      try {
+        console.log('MediaRecorder: Ensuring no recording is in progress...');
+        await cameraRef.current.stopRecording();
+        await new Promise(resolve => setTimeout(resolve, 500)); // Wait for cleanup
+      } catch (cleanupError) {
+        // Ignore errors during cleanup - they usually mean no recording was in progress
+        console.log('MediaRecorder: No active recording to clean up');
       }
 
+      console.log('MediaRecorder: Starting new video recording...');
+      const recording = await cameraRef.current.recordAsync();
+      videoRecordingRef.current = recording;
       setIsRecording(true);
-
-      const videoOptions = {
-        maxDuration: 60,
-        quality: '1080p', // Use string instead of VideoQuality.HD
-      };
-
-      console.log('MediaRecorder: Starting video recording with options:', videoOptions);
-      
-      // Use recordAsync instead of startRecordingAsync
-      const result = await cameraRef.current.recordAsync(videoOptions);
-      console.log('MediaRecorder: Video recording completed:', result);
-      
-      return result;
+      console.log('MediaRecorder: Recording started successfully');
     } catch (error) {
-      console.error('MediaRecorder: Error in video recording:', error);
-      throw error;
+      console.error('MediaRecorder: Failed to start recording:', error);
+      // Reset recording state and refs in case of error
+      videoRecordingRef.current = null;
+      setIsRecording(false);
+      Alert.alert('Erreur', 'Impossible de démarrer l\'enregistrement vidéo. Veuillez réessayer.');
     }
   };
 
@@ -174,12 +188,29 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
         throw new Error('Camera not available');
       }
 
-      // For recordAsync, we don't need to explicitly stop - it stops automatically
-      // This method might not be needed, but keeping for compatibility
-      console.log('MediaRecorder: Video recording will stop automatically');
+      if (!isRecording) {
+        throw new Error('No active recording to stop');
+      }
+
+      // Stop the recording
+      cameraRef.current.stopRecording();
+      console.log('MediaRecorder: Stop recording called');
+      
+      // Wait a moment for the recording to finalize
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      if (videoRecordingRef.current && videoRecordingRef.current.uri) {
+        const result = videoRecordingRef.current;
+        videoRecordingRef.current = null;
+        console.log('MediaRecorder: Video recording result:', result);
+        return result;
+      } else {
+        throw new Error('No video file produced');
+      }
       
     } catch (error) {
       console.error('MediaRecorder: Error stopping video recording:', error);
+      videoRecordingRef.current = null;
       throw error;
     }
   };
@@ -187,10 +218,12 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
   const handleStartRecording = async () => {
     try {
       if (recordingType === 'video') {
-        const result = await startVideoRecording();
-        if (result?.uri) {
-          await handleMediaUpload(result.uri);
-        }
+        // Don't await - let the recording run until stopped
+        startVideoRecording().catch(error => {
+          console.error('MediaRecorder: Video recording failed:', error);
+          Alert.alert('Erreur', 'Impossible de démarrer l\'enregistrement vidéo: ' + error.message);
+          resetStates();
+        });
       } else if (recordingType === 'audio') {
         // Audio recording is already started in handleRecordingTypeSelection
         console.log('MediaRecorder: Audio recording already in progress');
@@ -207,22 +240,29 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
       console.log('MediaRecorder: Stopping recording...');
       
       if (recordingType === 'video') {
-        await stopVideoRecording();
-        // The video result will be handled by the startVideoRecording promise
+        const result = await stopVideoRecording();
+        if (result?.uri) {
+          await handleMediaUpload(result.uri);
+        } else {
+          throw new Error('No video file produced');
+        }
       } else if (recordingType === 'audio') {
         const uri = await stopAudioRecording();
         if (uri) {
           await handleMediaUpload(uri);
+        } else {
+          throw new Error('No audio file produced');
         }
       }
     } catch (error) {
       console.error('MediaRecorder: Error stopping recording:', error);
       Alert.alert('Erreur', 'Impossible d\'arrêter l\'enregistrement: ' + error.message);
-      resetStates();
+    } finally {
+      setIsRecording(false);
     }
   };
 
-  const verifyFileExists = async (uri, maxRetries = 3) => {
+  const verifyFileExists = async (uri, maxRetries = 5) => {
     if (!uri) return false;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -236,12 +276,13 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
         }
         
         if (attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          console.log(`MediaRecorder: File not ready, waiting... (attempt ${attempt})`);
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Increased wait time
         }
       } catch (error) {
         console.error(`MediaRecorder: Error verifying file (attempt ${attempt}):`, error);
         if (attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
     }
@@ -267,7 +308,7 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
         console.error('MediaRecorder: Upload timeout');
         Alert.alert('Erreur', 'Délai d\'upload dépassé');
         resetStates();
-      }, 90000);
+      }, 120000); // Increased timeout
 
       setUploadProgress('Vérification du fichier...');
       const fileExists = await verifyFileExists(uri);
@@ -319,37 +360,81 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
     }
   };
 
-  const resetStates = () => {
+  const resetStates = async () => {
     console.log('MediaRecorder: Resetting states');
+    
+    // Try to stop any active video recording
+    if (cameraRef.current && isRecording) {
+      try {
+        console.log('MediaRecorder: Stopping active video recording during reset');
+        await cameraRef.current.stopRecording();
+      } catch (error) {
+        console.error('MediaRecorder: Error stopping video during reset:', error);
+      }
+    }
+    
+    // Clean up video recording reference
+    if (videoRecordingRef.current) {
+      console.log('MediaRecorder: Clearing video recording reference');
+      videoRecordingRef.current = null;
+    }
+    
+    // Clean up audio recording
+    if (recordingRef.current) {
+      console.log('MediaRecorder: Cleaning up audio recording');
+      try {
+        await recordingRef.current.stopAndUnloadAsync();
+      } catch (error) {
+        console.error('MediaRecorder: Error cleaning up audio:', error);
+      }
+      recordingRef.current = null;
+    }
+    
+    // Reset all state variables
     setIsRecording(false);
     setRecordingType(null);
     setIsUploading(false);
     setUploadProgress('');
     setShowCamera(false);
+    setCameraReady(false);
     
     if (uploadTimeoutRef.current) {
       clearTimeout(uploadTimeoutRef.current);
       uploadTimeoutRef.current = null;
-    }
-    
-    if (recordingRef.current) {
-      recordingRef.current.stopAndUnloadAsync().catch(console.error);
-      recordingRef.current = null;
     }
   };
 
   const toggleCameraFacing = () => {
     setCameraFacing(current => current === 'back' ? 'front' : 'back');
   };
-
   const handleCameraReady = () => {
-    console.log('MediaRecorder: Camera is ready');
-    // Auto-start recording if this is for initial video recording
-    if (recordingType === 'video' && !isRecording) {
+    console.log('MediaRecorder: Camera signaled ready');
+    setCameraReady(true);
+    
+    // Only auto-start if this was an initial recording request
+    if (initialRecordingType === 'video' && recordingType === 'video' && !isRecording) {
+      console.log('MediaRecorder: Scheduling auto-start recording...');
+      // Increased timeout to ensure camera is fully stable
       setTimeout(() => {
-        handleStartRecording();
-      }, 500);
+        // Double-check camera state before auto-starting
+        if (cameraRef.current && cameraReady && !isRecording) {
+          console.log('MediaRecorder: Conditions met, auto-starting video recording');
+          handleStartRecording();
+        } else {
+          console.log('MediaRecorder: Cannot auto-start, conditions not met:', {
+            hasCamera: !!cameraRef.current,
+            isCameraReady: cameraReady,
+            isRecording
+          });
+        }
+      }, 2000); // Increased from 1000ms to 2000ms
     }
+  };
+
+  const handleCameraMountError = (error) => {
+    console.error('MediaRecorder: Camera mount error:', error);
+    Alert.alert('Erreur', 'Impossible d\'initialiser la caméra: ' + error.message);
+    resetStates();
   };
 
   // Show loading while permissions are being initialized
@@ -408,20 +493,16 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
           ref={cameraRef}
           style={styles.camera}
           facing={cameraFacing}
-          video={true}
-          audio={true}
+          mode="video"
           onCameraReady={handleCameraReady}
-          onMountError={(error) => {
-            console.error('MediaRecorder: Camera mount error:', error);
-            Alert.alert('Erreur', 'Impossible d\'initialiser la caméra');
-            resetStates();
-          }}
+          onMountError={handleCameraMountError}
         />
         
         <View style={styles.cameraControls}>
           <View style={styles.recordingIndicator}>
             <Text style={styles.recordingText}>
-              {isRecording ? '🔴 Enregistrement vidéo...' : '📹 Prêt à enregistrer'}
+              {!cameraReady ? '📹 Initialisation...' :
+               isRecording ? '🔴 Enregistrement vidéo...' : '📹 Prêt à enregistrer'}
             </Text>
           </View>
           
@@ -429,17 +510,20 @@ const MediaRecorder = ({ onRecordingComplete, initialRecordingType }) => {
             <TouchableOpacity
               style={[styles.button, styles.flipButton]}
               onPress={toggleCameraFacing}
-              disabled={isRecording}
+              disabled={isRecording || !cameraReady}
             >
               <Text style={styles.buttonText}>🔄</Text>
             </TouchableOpacity>
             
             {!isRecording ? (
               <TouchableOpacity
-                style={[styles.button, styles.startButton]}
+                style={[styles.button, styles.startButton, (!cameraReady && styles.disabledButton)]}
                 onPress={handleStartRecording}
+                disabled={!cameraReady}
               >
-                <Text style={styles.buttonText}>Démarrer</Text>
+                <Text style={styles.buttonText}>
+                  {cameraReady ? 'Démarrer' : 'Chargement...'}
+                </Text>
               </TouchableOpacity>
             ) : (
               <TouchableOpacity
@@ -599,6 +683,10 @@ const styles = StyleSheet.create({
     height: 60,
     borderRadius: 30,
     padding: 10,
+  },
+  disabledButton: {
+    backgroundColor: '#cccccc',
+    opacity: 0.6,
   },
   buttonText: {
     color: 'white',
